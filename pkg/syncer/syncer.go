@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
@@ -50,6 +51,7 @@ import (
 	"github.com/kcp-dev/kcp/pkg/syncer/resourcesync"
 	"github.com/kcp-dev/kcp/pkg/syncer/spec"
 	"github.com/kcp-dev/kcp/pkg/syncer/status"
+	"github.com/kcp-dev/kcp/pkg/syncer/upsync"
 	"github.com/kcp-dev/kcp/third_party/keyfunctions"
 	. "github.com/kcp-dev/kcp/tmc/pkg/logging"
 )
@@ -256,6 +258,30 @@ func StartSyncer(ctx context.Context, cfg *SyncerConfig, numSyncerThreads int, i
 		return err
 	}
 
+	upstreamUpsyncConfig := rest.CopyConfig(cfg.UpstreamConfig)
+	// Upsyncing to Virtual Workspace for upsyncing
+	upstreamUpsyncConfig.Host = strings.Replace(syncerVirtualWorkspaceURL, "/services/syncer", "/services/upsyncer", 1)
+	upstreamConfig.UserAgent = "kcp#spec-syncer/" + kcpVersion
+	upstreamUpsyncClient, err := kcpdynamic.NewForConfig(upstreamConfig)
+	if err != nil {
+		return err
+	}
+
+	// Custom informers based on Upsync labels
+	upsyncUpstreamInformer := kcpdynamicinformer.NewFilteredDynamicSharedInformerFactory(upstreamDynamicClusterClient, resyncPeriod, func(o *metav1.ListOptions) {
+		o.LabelSelector = workloadv1alpha1.ClusterResourceStateLabelPrefix + syncTargetKey + "=" + string(workloadv1alpha1.ResourceStateUpsync)
+	})
+
+	downstreamFilteredInformers := dynamicinformer.NewFilteredDynamicSharedInformerFactoryWithOptions(downstreamDynamicClient, metav1.NamespaceAll, func(o *metav1.ListOptions) {
+		o.LabelSelector = workloadv1alpha1.ClusterResourceStateLabelPrefix + syncTargetKey + "=" + string(workloadv1alpha1.ResourceStateUpsync)
+	}, cache.WithResyncPeriod((resyncPeriod)), cache.WithKeyFunction(keyfunctions.DeletionHandlingMetaNamespaceKeyFunc))
+
+	logger.Info("Creating resource upsyncer")
+	upSyncer, err := upsync.NewUpSyncer(logger, cfg.SyncTargetWorkspace, cfg.SyncTargetName, syncTargetKey, upstreamUpsyncClient, downstreamDynamicClient, upsyncUpstreamInformer, downstreamFilteredInformers, syncerInformers, syncTarget.GetUID())
+	if err != nil {
+		return err
+	}
+
 	upstreamInformers.Start(ctx.Done())
 	downstreamInformers.Start(ctx.Done())
 	kcpInformerFactory.Start(ctx.Done())
@@ -270,6 +296,7 @@ func StartSyncer(ctx context.Context, cfg *SyncerConfig, numSyncerThreads int, i
 	go syncerInformers.Start(ctx, 1)
 	go specSyncer.Start(ctx, numSyncerThreads)
 	go statusSyncer.Start(ctx, numSyncerThreads)
+	go upSyncer.Start(ctx, numSyncerThreads)
 	go downstreamNamespaceController.Start(ctx, numSyncerThreads)
 	go upstreamNamespaceController.Start(ctx, numSyncerThreads)
 
